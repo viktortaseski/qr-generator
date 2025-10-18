@@ -1,0 +1,11 @@
+qr-codes/
+venv/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+
+qr-codes/
