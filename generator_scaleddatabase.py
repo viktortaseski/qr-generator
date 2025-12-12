@@ -1,8 +1,9 @@
-# generator.py
+# generator_scaleddatabase.py
 import os
 import secrets
 import string
 from pathlib import Path
+from urllib.parse import urlencode
 
 import psycopg2
 import qrcode
@@ -14,52 +15,46 @@ from qrcode.image.styles.colormasks import SolidFillColorMask
 from qrcode.image.styles.moduledrawers import CircleModuleDrawer
 
 # -------------------- CONFIG --------------------
-# This URL is what your *printed* QR encodes permanently (per-table token).
-# The backend will issue/validate *short-lived* session tokens when the app loads.
-BASE_URL = "https://selfserv-web.onrender.com/?token="
-OUTPUT_DIR = "qr-codes"
+# Base landing page (should not include query params)
+BASE_URL = "https://selfservscaled.onrender.com/"
+OUTPUT_DIR = "qr-codes-scaled"
 
-# Optional center logo (safe to leave blank / non-existent)
 LOGO_PATH = os.path.expanduser("~/Desktop/logo.png")
 
-# Tables to (ensure and) generate:
-START_INDEX = 1  # table00, table01, ...
-COUNT = 20  # how many tables from START_INDEX
+START_INDEX = 1
+COUNT = 10
 
-# QR appearance
-QR_BOX_SIZE = 12  # pixel size of each QR module
-QR_BORDER = 4  # quiet zone (modules) - keep >= 4
-LOGO_SCALE = 0.20  # logo width as fraction of QR width (0.15–0.25 is safe)
+QR_BOX_SIZE = 12
+QR_BORDER = 4
+LOGO_SCALE = 0.20
 
-# Pad behind logo (for contrast)
 ADD_WHITE_PAD = True
-WHITE_PAD_RATIO = 1.15  # how much larger the pad is vs logo
-PAD_ALPHA = 255  # fully opaque: avoids gray outline/halo
+WHITE_PAD_RATIO = 1.15
+PAD_ALPHA = 255
 PAD_ROUNDED = True
 
-# DB connection (your existing Render PG)
+RESTAURANT_ID = 2  # adjust to the target restaurant ID in scaleddatabase
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
+
 load_dotenv(ENV_PATH)
 DB_CFG = {
-    "host": os.getenv("HOST"),
-    "port": os.getenv("PORT", "5432"),
-    "dbname": os.getenv("DBNAME"),
-    "user": os.getenv("DBUSER"),
-    "password": os.getenv("DBPASS"),
-    "sslmode": os.getenv("SSLMODE", "require"),
+    "host": os.getenv("PGHOST"),
+    "port": os.getenv("PGPORT", "5432"),
+    "dbname": os.getenv("PGDATABASE"),
+    "user": os.getenv("PGUSER"),
+    "password": os.getenv("PGPASSWORD"),
+    "sslmode": os.getenv("PGSSLMODE", "require"),
 }
 # ------------------------------------------------
 
 
 def secure_token(n: int = 16) -> str:
-    """Generate a URL-safe, mixed-case + digits token of length n."""
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
 def load_logo_or_none(path: str):
-    """Try to load a logo; return PIL Image or None if missing."""
     try:
         if not path or not os.path.exists(path):
             return None
@@ -69,11 +64,6 @@ def load_logo_or_none(path: str):
 
 
 def make_qr_with_center_logo(data: str, logo_img: Image.Image | None) -> Image.Image:
-    """
-    Build a high-redundancy QR with circular modules and (optionally) place a centered logo.
-    Returns a PIL Image (RGBA).
-    """
-    # 1) Build the QR (circular modules)
     qr = qrcode.QRCode(
         version=None,
         error_correction=ERROR_CORRECT_H,
@@ -96,14 +86,12 @@ def make_qr_with_center_logo(data: str, logo_img: Image.Image | None) -> Image.I
 
     qr_w, qr_h = qr_img.size
 
-    # 2) Resize the logo
     logo = logo_img.copy()
     target_logo_w = int(qr_w * LOGO_SCALE)
     aspect = logo.height / max(1, logo.width)
     target_logo_h = int(target_logo_w * aspect)
     logo = logo.resize((max(1, target_logo_w), max(1, target_logo_h)), Image.LANCZOS)
 
-    # 3) Optional white pad behind logo
     if ADD_WHITE_PAD:
         pad_w = int(target_logo_w * WHITE_PAD_RATIO)
         pad_h = int(target_logo_h * WHITE_PAD_RATIO)
@@ -112,7 +100,6 @@ def make_qr_with_center_logo(data: str, logo_img: Image.Image | None) -> Image.I
 
         composed = Image.new("RGBA", (pad_w, pad_h), (255, 255, 255, 0))
 
-        # Create mask for rounded/square pad
         mask = Image.new("L", (pad_w, pad_h), 0)
         draw = ImageDraw.Draw(mask)
         if PAD_ROUNDED:
@@ -121,18 +108,15 @@ def make_qr_with_center_logo(data: str, logo_img: Image.Image | None) -> Image.I
         else:
             draw.rectangle([0, 0, pad_w, pad_h], fill=255)
 
-        # Solid white pad
         white_rect = Image.new("RGBA", (pad_w, pad_h), (255, 255, 255, PAD_ALPHA))
         composed.paste(white_rect, (0, 0), mask)
 
-        # Center logo on pad
         lx = (pad_w - target_logo_w) // 2
         ly = (pad_h - target_logo_h) // 2
         composed.paste(logo, (lx, ly), logo)
         logo = composed
         target_logo_w, target_logo_h = logo.size
 
-    # 4) Paste at center of QR
     x = (qr_w - target_logo_w) // 2
     y = (qr_h - target_logo_h) // 2
     qr_img.paste(logo, (x, y), logo)
@@ -140,24 +124,21 @@ def make_qr_with_center_logo(data: str, logo_img: Image.Image | None) -> Image.I
     return qr_img
 
 
-def ensure_table_and_token(cur, table_name: str) -> tuple[int, str]:
-    """
-    Ensure a row exists for table_name in restaurant_tables.
-    - If it exists and has a token, keep it (stable).
-    - If it exists but token is NULL/empty, set a new token.
-    - If it doesn't exist, create with a new token.
-    Returns (table_id, permanent_token).
-    """
+def ensure_table_and_token(cur, restaurant_id: int, table_name: str) -> tuple[int, str]:
     cur.execute(
-        "SELECT id, token FROM restaurant_tables WHERE name = %s", (table_name,)
+        """
+        SELECT id, token
+        FROM restaurant_tables
+        WHERE restaurant_id = %s AND name = %s
+        """,
+        (restaurant_id, table_name),
     )
     row = cur.fetchone()
 
     if row:
         table_id, token = row
         if token and token.strip():
-            return table_id, token  # keep existing
-        # set new token if missing
+            return table_id, token
         new_token = secure_token(16)
         cur.execute(
             "UPDATE restaurant_tables SET token = %s WHERE id = %s",
@@ -165,15 +146,14 @@ def ensure_table_and_token(cur, table_name: str) -> tuple[int, str]:
         )
         return table_id, new_token
 
-    # insert new row
     new_token = secure_token(16)
     cur.execute(
         """
-        INSERT INTO restaurant_tables (name, token)
-        VALUES (%s, %s)
+        INSERT INTO restaurant_tables (restaurant_id, name, token)
+        VALUES (%s, %s, %s)
         RETURNING id
         """,
-        (table_name, new_token),
+        (restaurant_id, table_name, new_token),
     )
     table_id = cur.fetchone()[0]
     return table_id, new_token
@@ -182,7 +162,6 @@ def ensure_table_and_token(cur, table_name: str) -> tuple[int, str]:
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Connect DB
     conn = psycopg2.connect(**DB_CFG)
     conn.autocommit = False
     cur = conn.cursor()
@@ -191,20 +170,23 @@ def main():
 
     try:
         for i in range(START_INDEX, START_INDEX + COUNT):
-            table_name = f"table{i:02d}"
+            table_name = f"Table{i:02d}"
+            table_id, token = ensure_table_and_token(cur, RESTAURANT_ID, table_name)
+            query = urlencode(
+                {
+                    "restaurant_id": RESTAURANT_ID,
+                    "token": token,
+                }
+            )
+            joiner = "&" if "?" in BASE_URL else "?"
+            base_url = BASE_URL.rstrip("&?")
+            url = f"{base_url}{joiner}{query}"
 
-            # Ensure row exists and obtain the (stable) permanent token
-            table_id, token = ensure_table_and_token(cur, table_name)
-            url = f"{BASE_URL}{token}"
-
-            # Build QR with (optional) centered logo
             qr_img = make_qr_with_center_logo(url, logo_img)
 
-            # Save PNG
             png_path = os.path.join(OUTPUT_DIR, f"{table_name}.png")
             qr_img.save(png_path)
 
-            # Update url + qr_code_path (token is intentionally NOT changed here)
             cur.execute(
                 """
                 UPDATE restaurant_tables
