@@ -8,5 +8,6 @@ venv/
 env/
 ENV/
 .env
+qr-codes-scaled/
 
 qr-codes/
