@@ -9,5 +9,6 @@ env/
 ENV/
 .env
 qr-codes-scaled/
+.DS_Store
 
 qr-codes/

@@ -33,7 +33,8 @@ WHITE_PAD_RATIO = 1.15
 PAD_ALPHA = 255
 PAD_ROUNDED = True
 
-RESTAURANT_ID = 2  # adjust to the target restaurant ID in scaleddatabase
+RESTAURANT_ID = 3  # adjust to the target restaurant ID in scaleddatabase
+TABLE_NAME = f"SelfServ" #change the table name e.g., Table01
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 
@@ -170,7 +171,7 @@ def main():
 
     try:
         for i in range(START_INDEX, START_INDEX + COUNT):
-            table_name = f"Table{i:02d}"
+            table_name = TABLE_NAME+f"{i:02d}"
             table_id, token = ensure_table_and_token(cur, RESTAURANT_ID, table_name)
             query = urlencode(
                 {
